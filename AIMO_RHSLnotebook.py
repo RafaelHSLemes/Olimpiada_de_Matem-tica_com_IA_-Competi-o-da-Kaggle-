@@ -2,84 +2,109 @@ import os
 import pandas as pd
 import polars as pl
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.pipeline import Pipeline
-from kaggle_evaluation import aimo_2_inference_server
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score
+from xgboost import XGBClassifier
+import kaggle_evaluation.aimo_2_inference_server as inference_server
 
-# Global variables for the model pipeline
-model_pipeline = None
+# Preprocess and global model
+vectorizer = TfidfVectorizer(max_features=1000)
+model = XGBClassifier(n_estimators=100, use_label_encoder=False, objective="multi:softmax", random_state=42)
 
-def train_model(training_file: str):
-    """
-    Train the supervised learning model using the provided data
-    """
-    global model_pipeline
+# Load data
+data = pd.read_csv("/kaggle/input/ai-mathematical-olympiad-progress-prize-2/reference.csv")
 
-    # Load the training dataset
-    train_data = pd.read_csv(training_file)
+# Process problems and answers
+data['processed_problem'] = list(vectorizer.fit_transform(data['problem']).toarray())
+data['processed_answer'] = data['answer'] % 1000  # Mod 1000 as defined for the competition
 
-    # Separate issues (features) and responses (labels)
-    x_train = train_data['problem']
-    y_train = train_data['answer']
+# Encode target variable
+label_encoder = LabelEncoder()
+data['encoded_answer'] = label_encoder.fit_transform(data['processed_answer'])
 
-    # Create the model pipeline
-    model_pipeline = Pipeline([
-        ("Vectorizer", TfidfVectorizer()), # Text vectorization
-        ("regressor", RandomForestRegressor(n_estimators=100, random_state=42)) # Regressor
-    ])
+# Analyse initial distribution
+class_counts = data['encoded_answer'].value_counts()
+print("Distribuição inicial das classes:")
+print(class_counts)
 
-    # Train the model
-    model_pipeline.fit(x_train, y_train)
-    print("Model trained successfully!")
+# Increase the data replicating instances (larger number of repetitions to meet conditions)
+augmented_data = data.copy()
+for _ in range(10):  # Increase the number of repetitions to generate more data
+    augmented_data = pd.concat([augmented_data, data.copy()], ignore_index=True)
 
-def solve_problem(problem: str):
-    """
-    Uses the trained model to predict the answer to the given problem
-    """
-    global model_pipeline
+# Update distribution after increase
+class_counts = augmented_data['encoded_answer'].value_counts()
+print("Distribution after data augmentation:")
+print(class_counts)
 
-    # Predict using the trained model
-    prediction = model_pipeline.predict([problem])[0]
+# Prepare features and target
+X = pd.DataFrame(augmented_data['processed_problem'].tolist())
+y = augmented_data['encoded_answer']
 
-    # Ensure the result is in the correct format
-    return int(prediction) % 1000
+# Adjust test_size to avoid problems
+test_size = max(10, len(augmented_data) // 10)  # Guarantees at least 10 samples
+train_size = len(augmented_data) - test_size
 
-# Predictor function required by the competition API
-def predict(id_: pl.DataFrame, problem: pl.DataFrame) -> pl.DataFrame | pd.DataFrame:
-    """
-    Generates a prediction for each problem using the provided data
-    """
+# Train-test split
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=test_size / len(augmented_data), random_state=42, stratify=y)
 
-    try:
-        # Unpack values
-        id_ = id_.to_series()[0]
-        question = problem.to_series()[0]
+# Verify the size of the set
+print(f"Size of train set: {len(X_train)}, Size of validation set: {len(X_val)}")
 
-        # Solve the problem
-        prediction = solve_problem(question)
+# Train the model
+model.fit(X_train, y_train)
 
-        # Return the prediction in the required format
-        return pl.DataFrame({'id': [id_], 'answer': [prediction]})
-    except Exception as e:
-        print(f"Error generating forecast for ID: {id_}, error: {e}")
-        return pl.DataFrame({'id': [id_], 'answer': [0]})
-    
-# Inference Server Configuration
-inference_server = aimo_2_inference_server.AIMO2InferenceServer(predict)
+# Validate the model
+y_pred_val = model.predict(X_val)
 
-if __name__ == "__main__":
-    # Check if it is a local or competition performance
-    if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
-        # Train the model with the training data
-        train_model('/kaggle/input/ai-mathematical-olympiad-progress-prize-2/reference.csv')
+# Custom scoring function
+def competition_score(y_true, y_pred):
+    correct_count = sum(y_t == y_p for y_t, y_p in zip(y_true, y_pred))
+    total = len(y_true)
+    return (correct_count / total) * 100  # Convert to percentage
 
-        # Start the server for the hidden test set
-        inference_server.serve()
-    else:
-        # Train the model with local data
-        train_model('train.csv')  # Arquivo de treinamento local
+score_val = competition_score(y_val, y_pred_val)
+print(f"Validation Competition Score: {score_val:.2f}")
 
-        # Run locally for testing with input set
-        inference_server.run_local_gateway((
-            '/kaggle/input/ai-mathematical-olympiad-progress-prize-2/test.csv',
-        ))
+# Prediction function
+def predict(id_: pl.DataFrame, question: pl.DataFrame) -> pl.DataFrame | pd.DataFrame:
+    """Makes a prediction"""
+    # Extracting values
+    id_ = id_.to_pandas().iloc[0, 0]
+    question = question.to_pandas().iloc[0, 0]
+
+    # Transforming the question
+    question_vector = vectorizer.transform([question]).toarray()
+
+    # Make the prediction
+    prediction_encoded = model.predict(question_vector)[0]
+    prediction = label_encoder.inverse_transform([int(prediction_encoded)])[0]  # Convert back to original scale
+
+    return pd.DataFrame({'id': [id_], 'answer': [prediction]})
+
+# Inference server
+inference_server = inference_server.AIMO2InferenceServer(predict)
+
+if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
+    inference_server.serve()
+else:
+    # Local evaluation
+    test_data = pd.read_csv('/kaggle/input/ai-mathematical-olympiad-progress-prize-2/reference.csv')
+    predictions = []
+
+    for _, row in test_data.iterrows():
+        id_ = pl.DataFrame({'id': [row['id']]})
+        question = pl.DataFrame({'problem': [row['problem']]})
+        prediction = predict(id_, question)
+        predictions.append(prediction['answer'].iloc[0])
+
+    # Calculate and show the Kaggle competition score
+    test_data['predicted_answer'] = predictions
+    test_data['processed_answer'] = test_data['answer'] % 1000
+
+    kaggle_score = competition_score(test_data['processed_answer'], test_data['predicted_answer'])
+    print(f"Final Competition Score: {kaggle_score:.2f}")
+
+    # Save the results
+    test_data[['id', 'predicted_answer']].to_csv('submission.csv', index=False)
